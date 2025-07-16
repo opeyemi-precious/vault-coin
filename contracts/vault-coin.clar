@@ -341,3 +341,86 @@
     (ok true)
   )
 )
+
+;; Withdraw collateral with safety checks
+(define-public (withdraw-collateral
+    (vault-id uint)
+    (stx-amount uint)
+  )
+  (let (
+      (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+      (stx-price (unwrap! (get-price "STX") ERR-ORACLE-PRICE-STALE))
+      (xbtc-price (unwrap! (get-price "xBTC") ERR-ORACLE-PRICE-STALE))
+      (remaining-stx (- (get stx-collateral vault) stx-amount))
+      (remaining-collateral-value (+ (* remaining-stx stx-price) (* (get xbtc-collateral vault) xbtc-price)))
+      (debt (get debt vault))
+    )
+    (asserts! (> vault-id u0) ERR-INVALID-AMOUNT)
+    (asserts! (is-eq (get owner vault) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (get is-active vault) ERR-VAULT-NOT-FOUND)
+    (asserts! (> stx-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= (get stx-collateral vault) stx-amount)
+      ERR-INSUFFICIENT-COLLATERAL
+    )
+    ;; Verify minimum collateral ratio is maintained
+    (if (> debt u0)
+      (asserts!
+        (>= (/ (* remaining-collateral-value u100) debt) MINIMUM-COLLATERAL-RATIO)
+        ERR-MINIMUM-COLLATERAL-RATIO
+      )
+      true
+    )
+    ;; Transfer collateral back to user
+    (try! (as-contract (stx-transfer? stx-amount tx-sender (get owner vault))))
+    ;; Update vault state
+    (map-set vaults { vault-id: vault-id }
+      (merge vault {
+        stx-collateral: remaining-stx,
+        last-update: stacks-block-height,
+      })
+    )
+    ;; Update protocol statistics
+    (var-set total-stx-collateral (- (var-get total-stx-collateral) stx-amount))
+    (ok true)
+  )
+)
+
+;; LIQUIDATION ENGINE
+
+;; Authorize liquidators with proper access control
+(define-public (set-liquidator
+    (liquidator principal)
+    (authorized bool)
+  )
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq liquidator tx-sender)) ERR-INVALID-AMOUNT)
+    (ok (map-set authorized-liquidators liquidator authorized))
+  )
+)
+
+;; Calculate vault health factor for liquidation assessment
+(define-read-only (calculate-health-factor (vault-id uint))
+  (match (map-get? vaults { vault-id: vault-id })
+    vault (match (get-price "STX")
+      stx-price (match (get-price "xBTC")
+        xbtc-price (let (
+            (collateral-value (+ (* (get stx-collateral vault) stx-price)
+              (* (get xbtc-collateral vault) xbtc-price)
+            ))
+            (debt (get debt vault))
+          )
+          (if (is-eq debt u0)
+            (ok u999999) ;; Infinite health factor if no debt
+            (ok (/ (* collateral-value u100) debt))
+          )
+        )
+        xbtc-err
+        ERR-ORACLE-PRICE-STALE
+      )
+      stx-err
+      ERR-ORACLE-PRICE-STALE
+    )
+    ERR-VAULT-NOT-FOUND
+  )
+)
