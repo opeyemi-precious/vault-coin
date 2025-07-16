@@ -424,3 +424,53 @@
     ERR-VAULT-NOT-FOUND
   )
 )
+
+;; Liquidate undercollateralized vault
+(define-public (liquidate-vault (vault-id uint))
+  (let (
+      (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+      (health-factor (unwrap! (calculate-health-factor vault-id) ERR-ORACLE-PRICE-STALE))
+      (debt (get debt vault))
+      (stx-collateral (get stx-collateral vault))
+      (xbtc-collateral (get xbtc-collateral vault))
+      (liquidation-amount (/ (* debt LIQUIDATION-PENALTY) u100))
+    )
+    (asserts! (default-to false (map-get? authorized-liquidators tx-sender))
+      ERR-NOT-AUTHORIZED
+    )
+    (asserts! (get is-active vault) ERR-VAULT-NOT-FOUND)
+    (asserts! (< health-factor LIQUIDATION-RATIO) ERR-LIQUIDATION-NOT-ALLOWED)
+    (asserts! (>= (ft-get-balance usdx tx-sender) debt)
+      ERR-INSUFFICIENT-USDX-BALANCE
+    )
+    ;; Burn liquidator's USDx to cover debt
+    (try! (ft-burn? usdx debt tx-sender))
+    ;; Calculate collateral distribution to liquidator
+    (let (
+        (stx-to-liquidator (/ (* stx-collateral liquidation-amount) debt))
+        (xbtc-to-liquidator (/ (* xbtc-collateral liquidation-amount) debt))
+      )
+      ;; Transfer collateral to liquidator
+      (try! (as-contract (stx-transfer? stx-to-liquidator tx-sender tx-sender)))
+      ;; Deactivate vault and update state
+      (map-set vaults { vault-id: vault-id }
+        (merge vault {
+          debt: u0,
+          stx-collateral: (- stx-collateral stx-to-liquidator),
+          xbtc-collateral: (- xbtc-collateral xbtc-to-liquidator),
+          is-active: false,
+          last-update: stacks-block-height,
+        })
+      )
+      ;; Update protocol statistics
+      (var-set total-debt (- (var-get total-debt) debt))
+      (var-set total-stx-collateral
+        (- (var-get total-stx-collateral) stx-to-liquidator)
+      )
+      (var-set total-xbtc-collateral
+        (- (var-get total-xbtc-collateral) xbtc-to-liquidator)
+      )
+      (ok true)
+    )
+  )
+)
